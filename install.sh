@@ -8,12 +8,15 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/sunapi386/voice-dictation/main/install.sh | bash
 #   curl -fsSL ... | bash -s -- --model distil-large-v3
 #   curl -fsSL ... | bash -s -- --model large-v3
+#   curl -fsSL ... | bash -s -- --latest
 
-REPO_URL="https://raw.githubusercontent.com/sunapi386/voice-dictation/main"
+VERSION="1.0.0"
+REPO="sunapi386/voice-dictation"
 INSTALL_DIR="$HOME/.local/share/voice-dictation"
 BIN_DIR="$HOME/.local/bin"
 MODEL=""
 SKIP_SHORTCUT=false
+USE_LATEST=false
 
 # ─── Parse args ──────────────────────────────────────────────────────────────
 
@@ -21,9 +24,21 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model) MODEL="$2"; shift 2 ;;
         --skip-shortcut) SKIP_SHORTCUT=true; shift ;;
+        --latest) USE_LATEST=true; shift ;;
+        --version|-v) echo "voice-dictation installer v${VERSION}"; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# ─── Resolve download URL ──────────────────────────────────────────────────
+
+if [[ "$USE_LATEST" == true ]]; then
+    REPO_URL="https://raw.githubusercontent.com/${REPO}/main"
+    info_tag="main (latest)"
+else
+    REPO_URL="https://raw.githubusercontent.com/${REPO}/v${VERSION}"
+    info_tag="v${VERSION}"
+fi
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -34,7 +49,7 @@ fail()  { echo -e "\033[1;31m✗\033[0m $*"; exit 1; }
 
 # ─── Preflight checks ───────────────────────────────────────────────────────
 
-info "Checking system..."
+info "Installing voice-dictation ${info_tag}..."
 
 [[ -f /etc/os-release ]] || fail "Cannot detect OS — expected Ubuntu 24.04+"
 source /etc/os-release
@@ -159,9 +174,10 @@ ok "Python environment ready"
 
 info "Downloading $MODEL model (this may take a minute)..."
 
-"$INSTALL_DIR/venv/bin/python" -c "
+MODEL="$MODEL" "$INSTALL_DIR/venv/bin/python" -c "
+import os
 from faster_whisper import WhisperModel
-WhisperModel('$MODEL', device='cpu', compute_type='int8')
+WhisperModel(os.environ['MODEL'], device='cpu', compute_type='int8')
 print('done')
 " 2>/dev/null
 
@@ -178,33 +194,17 @@ for script in $SCRIPTS; do
     chmod +x "$BIN_DIR/$script"
 done
 
-# Patch paths in shell scripts to match this install
-sed -i "s|\\\$HOME/.local/share/voice-dictation|$INSTALL_DIR|g" "$BIN_DIR/dictate-start"
-
-# Save chosen model
 echo "$MODEL" > "$HOME/.config/dictation-model"
 
-ok "Scripts installed"
+ok "Scripts installed (${info_tag})"
 
 # ─── Systemd service ────────────────────────────────────────────────────────
 
 info "Setting up auto-start service..."
 mkdir -p "$HOME/.config/systemd/user"
 
-cat > "$HOME/.config/systemd/user/voice-dictation.service" << SVCEOF
-[Unit]
-Description=Voice Dictation Daemon
-After=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=$INSTALL_DIR/venv/bin/python $BIN_DIR/dictate-daemon.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=graphical-session.target
-SVCEOF
+curl -fsSL "$REPO_URL/scripts/voice-dictation.service" \
+    -o "$HOME/.config/systemd/user/voice-dictation.service"
 
 systemctl --user daemon-reload
 systemctl --user enable voice-dictation 2>/dev/null
@@ -274,7 +274,7 @@ fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ok "Voice dictation installed!"
+ok "Voice dictation v${VERSION} installed!"
 echo ""
 echo "  Ctrl+Space          Toggle recording"
 echo "  Tray icon           Status + settings (model, sensitivity, hotkey)"
@@ -285,6 +285,8 @@ echo ""
 echo "  Model: $MODEL"
 echo "  Display: $SESSION_TYPE"
 echo "  Auto-start: enabled (starts on login)"
+echo ""
+echo "  Logs: journalctl --user -u voice-dictation -f"
 echo ""
 if [[ "$SESSION_TYPE" == "wayland" ]] && ! groups | grep -q '\binput\b'; then
     warn "Log out and back in for Wayland input permissions to take effect."

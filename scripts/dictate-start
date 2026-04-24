@@ -1,9 +1,9 @@
 #!/bin/bash
 VENV="$HOME/.local/share/voice-dictation/venv/bin/python"
-STATE_FILE="/tmp/dictation-state.json"
+STATE_FILE="${XDG_RUNTIME_DIR:-/tmp}/dictation-state.json"
 
 if [ -f "$STATE_FILE" ]; then
-    PID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['pid'])" 2>/dev/null)
+    PID=$(grep -o '"pid": *[0-9]*' "$STATE_FILE" 2>/dev/null | grep -o '[0-9]*')
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         notify-send -t 2000 "Dictation" "Already running"
         exit 0

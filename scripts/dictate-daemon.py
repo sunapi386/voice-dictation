@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -23,7 +24,8 @@ import sounddevice as sd
 from pynput import mouse as pynput_mouse
 
 SAMPLE_RATE = 16000
-STATE_FILE = "/tmp/dictation-state.json"
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATE_FILE = os.path.join(RUNTIME_DIR, "dictation-state.json")
 CONFIG_FILE = os.path.expanduser("~/.config/dictation-model")
 THRESHOLD_FILE = os.path.expanduser("~/.config/dictation-threshold")
 HOTKEY_FILE = os.path.expanduser("~/.config/dictation-hotkey")
@@ -65,35 +67,37 @@ ICONS = {
 }
 
 
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
 def get_configured_model():
-    if os.path.exists(CONFIG_FILE):
-        return open(CONFIG_FILE).read().strip()
-    return "distil-large-v3"
+    try:
+        return Path(CONFIG_FILE).read_text().strip()
+    except (OSError, ValueError):
+        return "distil-large-v3"
 
 
 def get_threshold():
-    if os.path.exists(THRESHOLD_FILE):
-        try:
-            return float(open(THRESHOLD_FILE).read().strip())
-        except ValueError:
-            pass
-    return 0.005
+    try:
+        return float(Path(THRESHOLD_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return 0.005
 
 
 def set_threshold(value):
-    with open(THRESHOLD_FILE, "w") as f:
-        f.write(str(value))
+    Path(THRESHOLD_FILE).write_text(str(value))
 
 
 def get_hotkey():
-    if os.path.exists(HOTKEY_FILE):
-        return open(HOTKEY_FILE).read().strip()
-    return "ctrl+space"
+    try:
+        return Path(HOTKEY_FILE).read_text().strip()
+    except (OSError, ValueError):
+        return "ctrl+space"
 
 
 def set_hotkey(value):
-    with open(HOTKEY_FILE, "w") as f:
-        f.write(value)
+    Path(HOTKEY_FILE).write_text(value)
 
 
 def type_text(text):
@@ -116,12 +120,23 @@ def hotkey_display_name(key):
     return key
 
 
+def _map_pynput_button(button):
+    """Map a pynput mouse button to an X button number, or None for left/right."""
+    btn_map = {
+        pynput_mouse.Button.x1: 8,
+        pynput_mouse.Button.x2: 9,
+        pynput_mouse.Button.middle: 2,
+    }
+    return btn_map.get(button)
+
+
 class DictationDaemon:
     def __init__(self):
         self.model_name = get_configured_model()
         self.model = None
         self.recording = False
         self.running = True
+        self.threshold = get_threshold()
         self.record_thread = None
         self.indicator = None
         self.status_item = None
@@ -134,17 +149,19 @@ class DictationDaemon:
 
     def load_model(self):
         from faster_whisper import WhisperModel
+        log(f"Loading model: {self.model_name}")
         notify(f"Loading {self.model_name}...")
         self.model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
-        notify("Ready — press Ctrl+Space to dictate")
+        hotkey = hotkey_display_name(get_hotkey())
+        log(f"Model loaded: {self.model_name}")
+        notify(f"Ready — press {hotkey} to dictate")
         GLib.idle_add(self._update_status_label)
 
     def switch_model(self, name):
         if name == self.model_name and self.model is not None:
             return
         self.model_name = name
-        with open(CONFIG_FILE, "w") as f:
-            f.write(name)
+        Path(CONFIG_FILE).write_text(name)
         was_recording = self.recording
         if was_recording:
             self.stop_recording()
@@ -173,8 +190,13 @@ class DictationDaemon:
         if self.recording:
             return
         if self.record_thread and self.record_thread.is_alive():
-            self.record_thread.join(timeout=2)
+            self.record_thread.join(timeout=5)
+            if self.record_thread.is_alive():
+                log("Previous recording thread still alive, waiting...")
+                notify("Finishing previous transcription...")
+                return
         self.recording = True
+        log("Recording started")
         self._set_icon("recording")
         self._update_toggle_label()
         self._update_status_label()
@@ -183,6 +205,7 @@ class DictationDaemon:
 
     def stop_recording(self):
         self.recording = False
+        log("Recording stopped")
         self._set_icon("idle")
         self._update_toggle_label()
         self._update_status_label()
@@ -192,7 +215,6 @@ class DictationDaemon:
         chunk_size = SAMPLE_RATE * chunk_ms // 1000
         pause_chunks = int(0.7 / (chunk_ms / 1000))
         min_speech_chunks = int(0.4 / (chunk_ms / 1000))
-        threshold = get_threshold()
 
         buf = []
         silence = 0
@@ -207,7 +229,7 @@ class DictationDaemon:
                     chunk = data[:, 0]
                     rms = np.sqrt(np.mean(chunk ** 2))
 
-                    if rms > threshold:
+                    if rms > self.threshold:
                         buf.append(chunk)
                         speech += 1
                         silence = 0
@@ -220,12 +242,14 @@ class DictationDaemon:
                             if speech >= min_speech_chunks:
                                 GLib.idle_add(self._set_icon, "transcribing")
                                 audio = np.concatenate(buf)
+                                log(f"Transcribing {len(audio)/SAMPLE_RATE:.1f}s of audio")
                                 segs, _ = self.model.transcribe(
                                     audio, beam_size=5, language="en",
                                     vad_filter=True,
                                 )
                                 text = " ".join(s.text.strip() for s in segs)
                                 if text.strip():
+                                    log(f"Typed: {text.strip()}")
                                     type_text(text + " ")
                                 if self.recording:
                                     GLib.idle_add(self._set_icon, "recording")
@@ -234,6 +258,7 @@ class DictationDaemon:
                             speech = 0
                             active = False
         except Exception as e:
+            log(f"Recording error: {e}")
             notify(f"Recording error: {e}")
             self.recording = False
             GLib.idle_add(self._set_icon, "idle")
@@ -242,45 +267,39 @@ class DictationDaemon:
 
     # ── Mouse listener ──
 
-    def _setup_mouse_listener(self):
+    def _setup_mouse_listener(self, capture_only=False):
         if self.mouse_listener:
             self.mouse_listener.stop()
             self.mouse_listener = None
 
         hotkey = get_hotkey()
-        if not hotkey.startswith("mouse:"):
-            return
 
-        button_num = int(hotkey.split(":")[1])
-        target_button = pynput_mouse.Button.middle
-        if button_num == 8:
-            target_button = pynput_mouse.Button.x1
-        elif button_num == 9:
-            target_button = pynput_mouse.Button.x2
-        elif button_num == 2:
-            target_button = pynput_mouse.Button.middle
+        target_button = None
+        if not capture_only and hotkey.startswith("mouse:"):
+            button_num = int(hotkey.split(":")[1])
+            target_button = {
+                8: pynput_mouse.Button.x1,
+                9: pynput_mouse.Button.x2,
+                2: pynput_mouse.Button.middle,
+            }.get(button_num, pynput_mouse.Button.middle)
 
         def on_click(x, y, button, pressed):
             if not pressed:
                 return
             if self.capture_next_click:
-                btn_num = 2
-                if button == pynput_mouse.Button.x1:
-                    btn_num = 8
-                elif button == pynput_mouse.Button.x2:
-                    btn_num = 9
-                elif button == pynput_mouse.Button.middle:
-                    btn_num = 2
-                else:
-                    btn_num = getattr(button, 'value', 2)
+                btn_num = _map_pynput_button(button)
+                if btn_num is None:
+                    notify("Use a thumb or middle button, not left/right click")
+                    return
                 self.capture_next_click = False
                 new_key = f"mouse:{btn_num}"
                 set_hotkey(new_key)
+                self._remove_keyboard_hotkey()
                 GLib.idle_add(self._rebuild_hotkey_menu)
                 GLib.idle_add(self._setup_mouse_listener)
                 notify(f"Hotkey set to {hotkey_display_name(new_key)}")
                 return
-            if button == target_button:
+            if target_button and button == target_button:
                 GLib.idle_add(self.toggle)
 
         self.mouse_listener = pynput_mouse.Listener(on_click=on_click)
@@ -399,7 +418,7 @@ class DictationDaemon:
                 item.set_label(f"{prefix}{name} — {desc}")
 
     def _rebuild_threshold_menu(self):
-        current = get_threshold()
+        current = self.threshold
         for value, item in self.threshold_items.items():
             label = next(name for name, v in THRESHOLDS if v == value)
             prefix = "* " if value == current else "  "
@@ -426,6 +445,7 @@ class DictationDaemon:
 
     def _on_threshold_select(self, item, value):
         set_threshold(value)
+        self.threshold = value
         self._rebuild_threshold_menu()
         notify("Mic sensitivity updated")
 
@@ -433,11 +453,10 @@ class DictationDaemon:
         if value == "custom":
             notify("Click any mouse button to set as hotkey...")
             self.capture_next_click = True
-            if not self.mouse_listener:
-                self._setup_mouse_listener_for_capture()
+            if not self.mouse_listener or not self.mouse_listener.is_alive():
+                self._setup_mouse_listener(capture_only=True)
             return
 
-        old = get_hotkey()
         set_hotkey(value)
 
         if value.startswith("mouse:"):
@@ -452,40 +471,8 @@ class DictationDaemon:
         self._rebuild_hotkey_menu()
         notify(f"Hotkey: {hotkey_display_name(value)}")
 
-    def _setup_mouse_listener_for_capture(self):
-        """Start a temporary mouse listener just for capturing a custom button."""
-        if self.mouse_listener:
-            self.mouse_listener.stop()
-
-        def on_click(x, y, button, pressed):
-            if not pressed or not self.capture_next_click:
-                return
-            self.capture_next_click = False
-            btn_num = 2
-            if button == pynput_mouse.Button.x1:
-                btn_num = 8
-            elif button == pynput_mouse.Button.x2:
-                btn_num = 9
-            elif button == pynput_mouse.Button.middle:
-                btn_num = 2
-            else:
-                try:
-                    btn_num = button.value.vk if hasattr(button.value, 'vk') else 2
-                except Exception:
-                    btn_num = 2
-
-            new_key = f"mouse:{btn_num}"
-            set_hotkey(new_key)
-            self._remove_keyboard_hotkey()
-            GLib.idle_add(self._rebuild_hotkey_menu)
-            GLib.idle_add(self._setup_mouse_listener)
-            notify(f"Hotkey set to {hotkey_display_name(new_key)}")
-
-        self.mouse_listener = pynput_mouse.Listener(on_click=on_click)
-        self.mouse_listener.daemon = True
-        self.mouse_listener.start()
-
     def _on_quit(self, _):
+        log("Shutting down")
         self.recording = False
         self.running = False
         if self.mouse_listener:
@@ -519,7 +506,6 @@ class DictationDaemon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # Model section
         model_label = Gtk.MenuItem(label="Model")
         model_label.set_sensitive(False)
         menu.append(model_label)
@@ -533,14 +519,12 @@ class DictationDaemon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # Mic sensitivity section
         sens_label = Gtk.MenuItem(label="Mic Sensitivity")
         sens_label.set_sensitive(False)
         menu.append(sens_label)
 
-        current_threshold = get_threshold()
         for label, value in THRESHOLDS:
-            prefix = "* " if value == current_threshold else "  "
+            prefix = "* " if value == self.threshold else "  "
             item = Gtk.MenuItem(label=f"{prefix}{label}")
             item.connect("activate", self._on_threshold_select, value)
             menu.append(item)
@@ -548,7 +532,6 @@ class DictationDaemon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # Hotkey section
         hotkey_label = Gtk.MenuItem(label="Hotkey")
         hotkey_label.set_sensitive(False)
         menu.append(hotkey_label)
@@ -584,6 +567,7 @@ class DictationDaemon:
         return GLib.SOURCE_REMOVE
 
     def run(self):
+        log(f"Daemon starting (pid={os.getpid()}, session={SESSION_TYPE})")
         self.build_tray()
 
         threading.Thread(target=self.load_model, daemon=True).start()
@@ -592,7 +576,6 @@ class DictationDaemon:
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._on_sigterm)
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._on_sigterm)
 
-        # Set up mouse listener if hotkey is a mouse button
         hotkey = get_hotkey()
         if hotkey.startswith("mouse:"):
             self._setup_mouse_listener()
@@ -600,6 +583,7 @@ class DictationDaemon:
         with open(STATE_FILE, "w") as f:
             json.dump({"pid": os.getpid()}, f)
 
+        log("Entering GTK main loop")
         Gtk.main()
 
 

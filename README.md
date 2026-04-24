@@ -27,6 +27,9 @@ curl -fsSL ... | bash -s -- --model distil-large-v3
 
 # Realtime speed (needs 2GB+ RAM)
 curl -fsSL ... | bash -s -- --model distil-small.en
+
+# Install from latest main branch instead of tagged release
+curl -fsSL ... | bash -s -- --latest
 ```
 
 ## Usage
@@ -115,6 +118,7 @@ Models labeled **realtime** transcribe fast enough that text appears almost inst
 ```
 voice-dictation/
 ├── install.sh                      # One-line installer (curl | bash)
+├── VERSION                         # Release version (used by install.sh)
 ├── scripts/
 │   ├── dictate-daemon.py           # Main daemon: tray icon, recording, transcription
 │   ├── dictate-start               # Start the daemon
@@ -131,6 +135,9 @@ voice-dictation/
 ```bash
 # Check status
 systemctl --user status voice-dictation
+
+# View logs
+journalctl --user -u voice-dictation -f
 
 # Restart
 systemctl --user restart voice-dictation
