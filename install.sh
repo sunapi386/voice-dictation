@@ -143,10 +143,10 @@ fi
 info "Setting up Python environment..."
 mkdir -p "$INSTALL_DIR"
 
-if [[ -d "$INSTALL_DIR/venv" ]]; then
+if [[ ! -d "$INSTALL_DIR/venv" ]] || [[ ! -f "$INSTALL_DIR/venv/bin/python" ]]; then
     rm -rf "$INSTALL_DIR/venv"
+    python3 -m venv --system-site-packages "$INSTALL_DIR/venv"
 fi
-python3 -m venv --system-site-packages "$INSTALL_DIR/venv"
 
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q 2>/dev/null
 "$INSTALL_DIR/venv/bin/pip" install -q \
@@ -200,10 +200,17 @@ import sounddevice as sd
 SAMPLE_RATE = 16000
 STATE_FILE = "/tmp/dictation-state.json"
 CONFIG_FILE = os.path.expanduser("~/.config/dictation-model")
+THRESHOLD_FILE = os.path.expanduser("~/.config/dictation-threshold")
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "x11")
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3",
           "distil-large-v3", "distil-medium.en", "distil-small.en"]
+
+THRESHOLDS = [
+    ("Low (quiet mic)", 0.002),
+    ("Medium", 0.005),
+    ("High (loud mic)", 0.012),
+]
 
 ICONS = {
     "idle": "microphone-sensitivity-muted-symbolic",
@@ -215,7 +222,21 @@ ICONS = {
 def get_configured_model():
     if os.path.exists(CONFIG_FILE):
         return open(CONFIG_FILE).read().strip()
-    return "small"
+    return "distil-large-v3"
+
+
+def get_threshold():
+    if os.path.exists(THRESHOLD_FILE):
+        try:
+            return float(open(THRESHOLD_FILE).read().strip())
+        except ValueError:
+            pass
+    return 0.005
+
+
+def set_threshold(value):
+    with open(THRESHOLD_FILE, "w") as f:
+        f.write(str(value))
 
 
 def type_text(text):
@@ -240,6 +261,7 @@ class DictationDaemon:
         self.status_item = None
         self.toggle_item = None
         self.model_items = {}
+        self.threshold_items = {}
 
     def load_model(self):
         from faster_whisper import WhisperModel
@@ -281,24 +303,27 @@ class DictationDaemon:
     def start_recording(self):
         if self.recording:
             return
+        if self.record_thread and self.record_thread.is_alive():
+            self.record_thread.join(timeout=2)
         self.recording = True
-        GLib.idle_add(self._set_icon, "recording")
-        GLib.idle_add(self._update_toggle_label)
-        GLib.idle_add(self._update_status_label)
+        self._set_icon("recording")
+        self._update_toggle_label()
+        self._update_status_label()
         self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
         self.record_thread.start()
 
     def stop_recording(self):
         self.recording = False
-        GLib.idle_add(self._set_icon, "idle")
-        GLib.idle_add(self._update_toggle_label)
-        GLib.idle_add(self._update_status_label)
+        self._set_icon("idle")
+        self._update_toggle_label()
+        self._update_status_label()
 
     def _record_loop(self):
         chunk_ms = 100
         chunk_size = SAMPLE_RATE * chunk_ms // 1000
         pause_chunks = int(0.7 / (chunk_ms / 1000))
         min_speech_chunks = int(0.4 / (chunk_ms / 1000))
+        threshold = get_threshold()
 
         buf = []
         silence = 0
@@ -313,7 +338,7 @@ class DictationDaemon:
                     chunk = data[:, 0]
                     rms = np.sqrt(np.mean(chunk ** 2))
 
-                    if rms > 0.012:
+                    if rms > threshold:
                         buf.append(chunk)
                         speech += 1
                         silence = 0
@@ -366,16 +391,26 @@ class DictationDaemon:
 
     def _rebuild_model_menu(self):
         for name, item in self.model_items.items():
-            label = f"  {name}"
-            if name == self.model_name:
-                label = f"* {name}"
-            item.set_label(label)
+            prefix = "* " if name == self.model_name else "  "
+            item.set_label(f"{prefix}{name}")
+
+    def _rebuild_threshold_menu(self):
+        current = get_threshold()
+        for value, item in self.threshold_items.items():
+            label = next(name for name, v in THRESHOLDS if v == value)
+            prefix = "* " if value == current else "  "
+            item.set_label(f"{prefix}{label}")
 
     def _on_toggle(self, _):
         self.toggle()
 
     def _on_model_select(self, item, name):
         self.switch_model(name)
+
+    def _on_threshold_select(self, item, value):
+        set_threshold(value)
+        self._rebuild_threshold_menu()
+        notify(f"Mic sensitivity updated")
 
     def _on_quit(self, _):
         self.recording = False
@@ -422,6 +457,20 @@ class DictationDaemon:
 
         menu.append(Gtk.SeparatorMenuItem())
 
+        sens_label = Gtk.MenuItem(label="Mic Sensitivity")
+        sens_label.set_sensitive(False)
+        menu.append(sens_label)
+
+        current_threshold = get_threshold()
+        for label, value in THRESHOLDS:
+            prefix = "* " if value == current_threshold else "  "
+            item = Gtk.MenuItem(label=f"{prefix}{label}")
+            item.connect("activate", self._on_threshold_select, value)
+            menu.append(item)
+            self.threshold_items[value] = item
+
+        menu.append(Gtk.SeparatorMenuItem())
+
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", self._on_quit)
         menu.append(quit_item)
@@ -429,14 +478,22 @@ class DictationDaemon:
         menu.show_all()
         self.indicator.set_menu(menu)
 
+    def _on_sigusr1(self):
+        self.toggle()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_sigterm(self):
+        self._on_quit(None)
+        return GLib.SOURCE_REMOVE
+
     def run(self):
         self.build_tray()
 
         threading.Thread(target=self.load_model, daemon=True).start()
 
-        signal.signal(signal.SIGUSR1, lambda s, f: GLib.idle_add(self.toggle))
-        signal.signal(signal.SIGTERM, lambda s, f: GLib.idle_add(self._on_quit, None))
-        signal.signal(signal.SIGINT, lambda s, f: GLib.idle_add(self._on_quit, None))
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, self._on_sigusr1)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._on_sigterm)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._on_sigterm)
 
         with open(STATE_FILE, "w") as f:
             json.dump({"pid": os.getpid()}, f)
@@ -576,7 +633,7 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecStart=$INSTALL_DIR/venv/bin/python $BIN_DIR/dictate-daemon.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
