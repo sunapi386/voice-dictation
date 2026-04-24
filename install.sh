@@ -9,6 +9,7 @@ set -euo pipefail
 #   curl -fsSL ... | bash -s -- --model distil-large-v3
 #   curl -fsSL ... | bash -s -- --model large-v3
 
+REPO_URL="https://raw.githubusercontent.com/sunapi386/voice-dictation/main"
 INSTALL_DIR="$HOME/.local/share/voice-dictation"
 BIN_DIR="$HOME/.local/bin"
 MODEL=""
@@ -90,7 +91,7 @@ info "Installing system dependencies..."
 
 sudo apt-get update -qq 2>/dev/null || true
 sudo apt-get install -y -qq \
-    portaudio19-dev python3-venv python3-dev git \
+    portaudio19-dev python3-venv python3-dev git curl \
     pulseaudio-utils libnotify-bin \
     gir1.2-ayatanaappindicator3-0.1 \
     > /dev/null 2>&1
@@ -150,7 +151,7 @@ fi
 
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q 2>/dev/null
 "$INSTALL_DIR/venv/bin/pip" install -q \
-    faster-whisper numpy sounddevice soundfile 2>/dev/null
+    faster-whisper numpy sounddevice soundfile pynput 2>/dev/null
 
 ok "Python environment ready"
 
@@ -171,452 +172,17 @@ ok "Model $MODEL downloaded and cached"
 info "Installing scripts to $BIN_DIR..."
 mkdir -p "$BIN_DIR"
 
-# ── dictate-daemon.py ──
-
-cat > "$BIN_DIR/dictate-daemon.py" << 'PYEOF'
-#!/usr/bin/env python3
-"""Persistent voice dictation daemon with system tray icon.
-
-Loads the Whisper model once and stays resident. SIGUSR1 toggles recording.
-A tray icon shows status: idle, recording, or transcribing.
-"""
-
-import json
-import os
-import signal
-import subprocess
-import sys
-import threading
-
-import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator3
-from gi.repository import GLib, Gtk
-
-import numpy as np
-import sounddevice as sd
-
-SAMPLE_RATE = 16000
-STATE_FILE = "/tmp/dictation-state.json"
-CONFIG_FILE = os.path.expanduser("~/.config/dictation-model")
-THRESHOLD_FILE = os.path.expanduser("~/.config/dictation-threshold")
-SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "x11")
-
-MODELS = ["tiny", "base", "small", "medium", "large-v3",
-          "distil-large-v3", "distil-medium.en", "distil-small.en"]
-
-THRESHOLDS = [
-    ("Low (quiet mic)", 0.002),
-    ("Medium", 0.005),
-    ("High (loud mic)", 0.012),
-]
-
-ICONS = {
-    "idle": "microphone-sensitivity-muted-symbolic",
-    "recording": "microphone-sensitivity-high-symbolic",
-    "transcribing": "microphone-sensitivity-medium-symbolic",
-}
-
-
-def get_configured_model():
-    if os.path.exists(CONFIG_FILE):
-        return open(CONFIG_FILE).read().strip()
-    return "distil-large-v3"
-
-
-def get_threshold():
-    if os.path.exists(THRESHOLD_FILE):
-        try:
-            return float(open(THRESHOLD_FILE).read().strip())
-        except ValueError:
-            pass
-    return 0.005
-
-
-def set_threshold(value):
-    with open(THRESHOLD_FILE, "w") as f:
-        f.write(str(value))
-
-
-def type_text(text):
-    if SESSION_TYPE == "wayland":
-        subprocess.run(["ydotool", "type", "--", text], check=False)
-    else:
-        subprocess.run(["xdotool", "type", "--delay", "12", "--", text], check=False)
-
-
-def notify(message):
-    subprocess.run(["notify-send", "-t", "2000", "Dictation", message], check=False)
-
-
-class DictationDaemon:
-    def __init__(self):
-        self.model_name = get_configured_model()
-        self.model = None
-        self.recording = False
-        self.running = True
-        self.record_thread = None
-        self.indicator = None
-        self.status_item = None
-        self.toggle_item = None
-        self.model_items = {}
-        self.threshold_items = {}
-
-    def load_model(self):
-        from faster_whisper import WhisperModel
-        notify(f"Loading {self.model_name}...")
-        self.model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
-        notify("Ready — press Ctrl+Space to dictate")
-        GLib.idle_add(self._update_status_label)
-
-    def switch_model(self, name):
-        if name == self.model_name and self.model is not None:
-            return
-        self.model_name = name
-        with open(CONFIG_FILE, "w") as f:
-            f.write(name)
-        was_recording = self.recording
-        if was_recording:
-            self.stop_recording()
-        self.model = None
-        GLib.idle_add(self._set_icon, "idle")
-        GLib.idle_add(self._update_status_label)
-        threading.Thread(target=self._reload_model_and_resume,
-                         args=(was_recording,), daemon=True).start()
-
-    def _reload_model_and_resume(self, resume):
-        self.load_model()
-        GLib.idle_add(self._rebuild_model_menu)
-        if resume:
-            GLib.idle_add(self.start_recording)
-
-    def toggle(self):
-        if self.model is None:
-            notify("Model still loading...")
-            return
-        if self.recording:
-            self.stop_recording()
-        else:
-            self.start_recording()
-
-    def start_recording(self):
-        if self.recording:
-            return
-        if self.record_thread and self.record_thread.is_alive():
-            self.record_thread.join(timeout=2)
-        self.recording = True
-        self._set_icon("recording")
-        self._update_toggle_label()
-        self._update_status_label()
-        self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
-        self.record_thread.start()
-
-    def stop_recording(self):
-        self.recording = False
-        self._set_icon("idle")
-        self._update_toggle_label()
-        self._update_status_label()
-
-    def _record_loop(self):
-        chunk_ms = 100
-        chunk_size = SAMPLE_RATE * chunk_ms // 1000
-        pause_chunks = int(0.7 / (chunk_ms / 1000))
-        min_speech_chunks = int(0.4 / (chunk_ms / 1000))
-        threshold = get_threshold()
-
-        buf = []
-        silence = 0
-        speech = 0
-        active = False
-
-        try:
-            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                                blocksize=chunk_size) as stream:
-                while self.recording:
-                    data, _ = stream.read(chunk_size)
-                    chunk = data[:, 0]
-                    rms = np.sqrt(np.mean(chunk ** 2))
-
-                    if rms > threshold:
-                        buf.append(chunk)
-                        speech += 1
-                        silence = 0
-                        active = True
-                    elif active:
-                        buf.append(chunk)
-                        silence += 1
-
-                        if silence >= pause_chunks:
-                            if speech >= min_speech_chunks:
-                                GLib.idle_add(self._set_icon, "transcribing")
-                                audio = np.concatenate(buf)
-                                segs, _ = self.model.transcribe(
-                                    audio, beam_size=5, language="en",
-                                    vad_filter=True,
-                                )
-                                text = " ".join(s.text.strip() for s in segs)
-                                if text.strip():
-                                    type_text(text + " ")
-                                if self.recording:
-                                    GLib.idle_add(self._set_icon, "recording")
-                            buf.clear()
-                            silence = 0
-                            speech = 0
-                            active = False
-        except Exception as e:
-            notify(f"Recording error: {e}")
-            self.recording = False
-            GLib.idle_add(self._set_icon, "idle")
-            GLib.idle_add(self._update_toggle_label)
-            GLib.idle_add(self._update_status_label)
-
-    def _set_icon(self, state):
-        if self.indicator:
-            self.indicator.set_icon_full(ICONS[state], state)
-
-    def _update_toggle_label(self):
-        if self.toggle_item:
-            self.toggle_item.set_label("Stop Recording" if self.recording else "Start Recording")
-
-    def _update_status_label(self):
-        if self.status_item:
-            if self.model is None:
-                status = f"Loading {self.model_name}..."
-            elif self.recording:
-                status = f"Recording ({self.model_name})"
-            else:
-                status = f"Ready ({self.model_name})"
-            self.status_item.set_label(status)
-
-    def _rebuild_model_menu(self):
-        for name, item in self.model_items.items():
-            prefix = "* " if name == self.model_name else "  "
-            item.set_label(f"{prefix}{name}")
-
-    def _rebuild_threshold_menu(self):
-        current = get_threshold()
-        for value, item in self.threshold_items.items():
-            label = next(name for name, v in THRESHOLDS if v == value)
-            prefix = "* " if value == current else "  "
-            item.set_label(f"{prefix}{label}")
-
-    def _on_toggle(self, _):
-        self.toggle()
-
-    def _on_model_select(self, item, name):
-        self.switch_model(name)
-
-    def _on_threshold_select(self, item, value):
-        set_threshold(value)
-        self._rebuild_threshold_menu()
-        notify(f"Mic sensitivity updated")
-
-    def _on_quit(self, _):
-        self.recording = False
-        self.running = False
-        try:
-            os.unlink(STATE_FILE)
-        except OSError:
-            pass
-        Gtk.main_quit()
-
-    def build_tray(self):
-        self.indicator = AppIndicator3.Indicator.new(
-            "voice-dictation",
-            ICONS["idle"],
-            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
-        )
-        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-        self.indicator.set_title("Voice Dictation")
-
-        menu = Gtk.Menu()
-
-        self.status_item = Gtk.MenuItem(label="Loading...")
-        self.status_item.set_sensitive(False)
-        menu.append(self.status_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        self.toggle_item = Gtk.MenuItem(label="Start Recording")
-        self.toggle_item.connect("activate", self._on_toggle)
-        menu.append(self.toggle_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        model_label = Gtk.MenuItem(label="Model")
-        model_label.set_sensitive(False)
-        menu.append(model_label)
-
-        for name in MODELS:
-            prefix = "* " if name == self.model_name else "  "
-            item = Gtk.MenuItem(label=f"{prefix}{name}")
-            item.connect("activate", self._on_model_select, name)
-            menu.append(item)
-            self.model_items[name] = item
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        sens_label = Gtk.MenuItem(label="Mic Sensitivity")
-        sens_label.set_sensitive(False)
-        menu.append(sens_label)
-
-        current_threshold = get_threshold()
-        for label, value in THRESHOLDS:
-            prefix = "* " if value == current_threshold else "  "
-            item = Gtk.MenuItem(label=f"{prefix}{label}")
-            item.connect("activate", self._on_threshold_select, value)
-            menu.append(item)
-            self.threshold_items[value] = item
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", self._on_quit)
-        menu.append(quit_item)
-
-        menu.show_all()
-        self.indicator.set_menu(menu)
-
-    def _on_sigusr1(self):
-        self.toggle()
-        return GLib.SOURCE_CONTINUE
-
-    def _on_sigterm(self):
-        self._on_quit(None)
-        return GLib.SOURCE_REMOVE
-
-    def run(self):
-        self.build_tray()
-
-        threading.Thread(target=self.load_model, daemon=True).start()
-
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, self._on_sigusr1)
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._on_sigterm)
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._on_sigterm)
-
-        with open(STATE_FILE, "w") as f:
-            json.dump({"pid": os.getpid()}, f)
-
-        Gtk.main()
-
-
-if __name__ == "__main__":
-    DictationDaemon().run()
-PYEOF
-
-# ── dictate-toggle ──
-
-cat > "$BIN_DIR/dictate-toggle" << TOGGLEEOF
-#!/bin/bash
-STATE_FILE="/tmp/dictation-state.json"
-
-if [ ! -f "\$STATE_FILE" ]; then
-    notify-send -t 2000 "Dictation" "Daemon not running — starting it..."
-    $BIN_DIR/dictate-start &
-    exit 0
-fi
-
-PID=\$(python3 -c "import json; print(json.load(open('\$STATE_FILE'))['pid'])" 2>/dev/null)
-
-if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
-    kill -USR1 "\$PID"
-else
-    rm -f "\$STATE_FILE"
-    notify-send -t 2000 "Dictation" "Daemon not running — starting it..."
-    $BIN_DIR/dictate-start &
-fi
-TOGGLEEOF
-
-# ── dictate-start ──
-
-cat > "$BIN_DIR/dictate-start" << STARTEOF
-#!/bin/bash
-STATE_FILE="/tmp/dictation-state.json"
-
-if [ -f "\$STATE_FILE" ]; then
-    PID=\$(python3 -c "import json; print(json.load(open('\$STATE_FILE'))['pid'])" 2>/dev/null)
-    if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
-        notify-send -t 2000 "Dictation" "Already running"
-        exit 0
-    fi
-    rm -f "\$STATE_FILE"
-fi
-
-$INSTALL_DIR/venv/bin/python $BIN_DIR/dictate-daemon.py &
-disown
-STARTEOF
-
-# ── dictate-stop ──
-
-cat > "$BIN_DIR/dictate-stop" << STOPEOF
-#!/bin/bash
-STATE_FILE="/tmp/dictation-state.json"
-
-if [ ! -f "\$STATE_FILE" ]; then
-    exit 0
-fi
-
-PID=\$(python3 -c "import json; print(json.load(open('\$STATE_FILE'))['pid'])" 2>/dev/null)
-if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
-    kill "\$PID" 2>/dev/null
-fi
-rm -f "\$STATE_FILE"
-STOPEOF
-
-# ── dictate-model ──
-
-cat > "$BIN_DIR/dictate-model" << 'MODELEOF'
-#!/bin/bash
-MODEL_FILE="$HOME/.config/dictation-model"
-MODELS="tiny base small medium large-v3 distil-large-v3 distil-medium.en distil-small.en"
-
-if [ -z "$1" ]; then
-    CURRENT="small"
-    [ -f "$MODEL_FILE" ] && CURRENT=$(cat "$MODEL_FILE")
-    echo "Current model: $CURRENT"
-    echo ""
-    echo "  tiny              75MB   ~1GB RAM   Fastest, lower accuracy"
-    echo "  base             142MB   ~1GB RAM   Fast, decent accuracy"
-    echo "  small            466MB   ~2GB RAM   Good balance (default)"
-    echo "  medium           1.5GB   ~5GB RAM   Better accuracy, slower"
-    echo "  distil-medium.en 1.5GB   ~5GB RAM   Fast + accurate (English)"
-    echo "  distil-large-v3    2GB   ~5GB RAM   Near-best accuracy, fast"
-    echo "  large-v3           3GB  ~10GB RAM   Best accuracy, slowest"
-    echo "  distil-small.en  466MB   ~2GB RAM   Fast (English only)"
-    echo ""
-    echo "Usage: dictate-model <model>"
-    echo "Change takes effect immediately if the daemon is running."
-    exit 0
-fi
-
-for m in $MODELS; do
-    if [ "$1" = "$m" ]; then
-        echo "$1" > "$MODEL_FILE"
-        echo "Model set to: $1"
-
-        # Signal daemon to reload if running
-        STATE_FILE="/tmp/dictation-state.json"
-        if [ -f "$STATE_FILE" ]; then
-            echo "Restarting daemon with new model..."
-            PID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['pid'])" 2>/dev/null)
-            if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-                kill "$PID" 2>/dev/null
-                sleep 1
-            fi
-            rm -f "$STATE_FILE"
-            ~/.local/bin/dictate-start
-        fi
-        exit 0
-    fi
+SCRIPTS="dictate-daemon.py dictate-start dictate-stop dictate-toggle dictate-model"
+for script in $SCRIPTS; do
+    curl -fsSL "$REPO_URL/scripts/$script" -o "$BIN_DIR/$script"
+    chmod +x "$BIN_DIR/$script"
 done
 
-echo "Unknown model: $1"
-echo "Available: $MODELS"
-exit 1
-MODELEOF
+# Patch paths in shell scripts to match this install
+sed -i "s|\\\$HOME/.local/share/voice-dictation|$INSTALL_DIR|g" "$BIN_DIR/dictate-start"
 
-chmod +x "$BIN_DIR"/dictate-{daemon.py,start,stop,toggle,model}
+# Save chosen model
+echo "$MODEL" > "$HOME/.config/dictation-model"
 
 ok "Scripts installed"
 
@@ -711,13 +277,13 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 ok "Voice dictation installed!"
 echo ""
 echo "  Ctrl+Space          Toggle recording"
+echo "  Tray icon           Status + settings (model, sensitivity, hotkey)"
 echo "  dictate-model       Show/change whisper model"
 echo "  dictate-stop        Stop the daemon"
 echo "  dictate-start       Start the daemon"
 echo ""
 echo "  Model: $MODEL"
 echo "  Display: $SESSION_TYPE"
-echo "  Tray icon: microphone in system tray"
 echo "  Auto-start: enabled (starts on login)"
 echo ""
 if [[ "$SESSION_TYPE" == "wayland" ]] && ! groups | grep -q '\binput\b'; then

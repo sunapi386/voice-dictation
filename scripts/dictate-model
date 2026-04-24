@@ -1,0 +1,46 @@
+#!/bin/bash
+MODEL_FILE="$HOME/.config/dictation-model"
+MODELS="tiny base small medium large-v3 distil-large-v3 distil-medium.en distil-small.en"
+
+if [ -z "$1" ]; then
+    CURRENT="distil-large-v3"
+    [ -f "$MODEL_FILE" ] && CURRENT=$(cat "$MODEL_FILE")
+    echo "Current model: $CURRENT"
+    echo ""
+    echo "  tiny              75MB   ~1GB RAM   Realtime, lower accuracy"
+    echo "  base             142MB   ~1GB RAM   Realtime, decent"
+    echo "  distil-small.en  466MB   ~2GB RAM   Realtime, good (English)"
+    echo "  small            466MB   ~2GB RAM   Fast, good"
+    echo "  distil-medium.en 1.5GB   ~5GB RAM   Fast, great (English)"
+    echo "  distil-large-v3    2GB   ~5GB RAM   Moderate, near-best"
+    echo "  medium           1.5GB   ~5GB RAM   Slow, great"
+    echo "  large-v3           3GB  ~10GB RAM   Slowest, best accuracy"
+    echo ""
+    echo "Usage: dictate-model <model>"
+    echo "Change takes effect immediately if the daemon is running."
+    exit 0
+fi
+
+for m in $MODELS; do
+    if [ "$1" = "$m" ]; then
+        echo "$1" > "$MODEL_FILE"
+        echo "Model set to: $1"
+
+        STATE_FILE="/tmp/dictation-state.json"
+        if [ -f "$STATE_FILE" ]; then
+            echo "Restarting daemon with new model..."
+            PID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['pid'])" 2>/dev/null)
+            if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                kill "$PID" 2>/dev/null
+                sleep 1
+            fi
+            rm -f "$STATE_FILE"
+            "$HOME/.local/bin/dictate-start"
+        fi
+        exit 0
+    fi
+done
+
+echo "Unknown model: $1"
+echo "Available: $MODELS"
+exit 1

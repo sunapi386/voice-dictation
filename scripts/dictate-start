@@ -1,0 +1,15 @@
+#!/bin/bash
+VENV="$HOME/.local/share/voice-dictation/venv/bin/python"
+STATE_FILE="/tmp/dictation-state.json"
+
+if [ -f "$STATE_FILE" ]; then
+    PID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['pid'])" 2>/dev/null)
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        notify-send -t 2000 "Dictation" "Already running"
+        exit 0
+    fi
+    rm -f "$STATE_FILE"
+fi
+
+$VENV "$HOME/.local/bin/dictate-daemon.py" &
+disown

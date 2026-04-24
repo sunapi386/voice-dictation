@@ -1,0 +1,12 @@
+[Unit]
+Description=Voice Dictation Daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/voice-dictation/venv/bin/python %h/.local/bin/dictate-daemon.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

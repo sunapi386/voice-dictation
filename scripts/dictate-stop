@@ -1,0 +1,12 @@
+#!/bin/bash
+STATE_FILE="/tmp/dictation-state.json"
+
+if [ ! -f "$STATE_FILE" ]; then
+    exit 0
+fi
+
+PID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['pid'])" 2>/dev/null)
+if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" 2>/dev/null
+fi
+rm -f "$STATE_FILE"
