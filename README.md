@@ -1,14 +1,35 @@
-# Voice Dictation for Ubuntu
+# Voice Dictation for Linux
 
-Offline, real-time voice dictation for Ubuntu 24.04+. Press a hotkey to start talking, press again to stop. Text appears phrase-by-phrase as you speak — works in any app.
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20(X11%20%2B%20Wayland)-blue)
+![Offline](https://img.shields.io/badge/100%25-offline-success)
 
-Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper) for transcription. No cloud, no API keys, no subscriptions.
+**Press a key, talk, and your words appear in any app.** 100% offline. No cloud, no API keys, no subscription. The Superwhisper / Wispr Flow experience, finally on Linux (Wayland included).
+
+![demo](docs/demo.gif)
+
+<sub>Replace `docs/demo.gif` with a real screen recording. See [Recording a demo](#recording-a-demo).</sub>
+
+Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper) for transcription, all on-device.
 
 - Works on both **X11** and **Wayland**
 - **System tray icon** — status, model, sensitivity, and hotkey all configurable from the dropdown
 - **Model stays loaded in RAM** — no startup delay when you press the hotkey
 - **Auto-starts on login** via systemd user service
 - **Configurable hotkey** — keyboard shortcuts, mouse thumb buttons, or any mouse button
+
+## Why this exists
+
+macOS and Windows have great push-to-talk dictation ([Superwhisper](https://superwhisper.com/), [Wispr Flow](https://wisprflow.ai/)). Linux has almost nothing that just works, especially under Wayland. This is that tool: a single hotkey, instant response, fully local.
+
+| | This | Superwhisper / Wispr Flow | Built-in dictation |
+|---|---|---|---|
+| Linux + Wayland | yes | no | partial |
+| Offline / private | yes | varies | varies |
+| Free & open source | yes (MIT) | no (paid) | yes |
+| Types into any app | yes | yes | yes |
+
+> Targets **Ubuntu 24.04+ / GNOME**, but the daemon is plain Python plus faster-whisper. See [Requirements](#requirements) for other distros.
 
 ## Install
 
@@ -165,6 +186,21 @@ All config is in `~/.config/`:
 - 2GB+ RAM (more = better model options)
 - Working microphone
 - GNOME desktop (for tray icon and keyboard shortcuts)
+
+## Recording a demo
+
+The single highest-leverage thing for this repo. A 10 second clip of you pressing the hotkey and watching text appear sells it better than any paragraph. Open a text editor, then:
+
+```bash
+# X11 or Wayland (GNOME): built-in screen recorder
+#   Ctrl+Alt+Shift+R to start/stop, saves to ~/Videos
+
+# Convert to an optimized GIF (install: sudo apt install ffmpeg gifsicle)
+ffmpeg -i ~/Videos/recording.webm -vf "fps=12,scale=900:-1:flags=lanczos" -t 12 /tmp/demo.gif
+gifsicle -O3 --lossy=80 /tmp/demo.gif -o docs/demo.gif
+```
+
+Keep it under ~12 seconds and a few MB so it loads fast on the GitHub page.
 
 ## Troubleshooting
 
