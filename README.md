@@ -8,7 +8,7 @@
 
 ![demo](docs/demo.gif)
 
-<sub>Replace `docs/demo.gif` with a real screen recording. See [Recording a demo](#recording-a-demo).</sub>
+**Watch with audio:** https://github.com/user-attachments/assets/b4a062ae-a6fe-4b56-b9a9-8fafd8521357
 
 Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (OpenAI Whisper) for transcription, all on-device.
 
